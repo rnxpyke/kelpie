@@ -32,6 +32,12 @@ impl RawSeries {
     pub fn serial_size_hint(&self) -> usize {
         self.data.len() * (8 * 2)
     }
+
+    pub fn compress(&self) -> Chunk {
+        Chunk {
+            compressed_data: raw_compress(&self),
+        }
+    }
 }
 
 pub enum DecompressError {
@@ -106,6 +112,7 @@ fn raw_compress(raw: &RawSeries) -> Vec<u8> {
     let compressed_times = {
         let cfg = CompressorConfig::default()
             .with_use_gcds(false)
+            .with_compression_level(8)
             .with_delta_encoding_order(2);
         let timevec: Vec<i64> = raw.data.keys().copied().collect();
 
@@ -114,7 +121,8 @@ fn raw_compress(raw: &RawSeries) -> Vec<u8> {
     let compressed_vals = {
         let cfg = CompressorConfig::default()
             .with_use_gcds(false)
-            .with_delta_encoding_order(1);
+            .with_delta_encoding_order(1)
+            .with_compression_level(8);
         let timevec: Vec<f64> = raw.data.values().copied().collect();
 
         q_compress::Compressor::from_config(cfg).simple_compress(&timevec)
@@ -128,14 +136,42 @@ fn raw_compress(raw: &RawSeries) -> Vec<u8> {
     res
 }
 
-pub struct Chunk {}
+pub struct Chunk {
+    pub(crate) compressed_data: Vec<u8>,
+}
 
-pub enum SetChunkError {}
+impl Chunk {
+    pub fn decompress(&self) -> Result<RawSeries, DecompressError> {
+        raw_decompress(&self.compressed_data)
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum SetChunkError {
+    #[error("Driver error")]
+    Driver(#[from] Box<dyn std::error::Error>),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum GetChunkError {
+    #[error("Driver error")]
+    Driver(#[from] Box<dyn std::error::Error>),
+}
 
 pub trait KelpieChunkStore {
-    fn get_chunk(series_key: u64, start: u64, stop: u64) -> Option<Chunk>;
-    fn set_chunk(series_key: u64, start: u64, stop: u64, chunk: Chunk)
-        -> Result<(), SetChunkError>;
+    fn get_chunk(
+        &self,
+        series_key: i64,
+        start: i64,
+        stop: i64,
+    ) -> Result<Option<Chunk>, GetChunkError>;
+    fn set_chunk(
+        &mut self,
+        series_key: i64,
+        start: i64,
+        stop: i64,
+        chunk: &Chunk,
+    ) -> Result<(), SetChunkError>;
 }
 
 pub struct SqliteChunkStore {
@@ -148,25 +184,80 @@ impl SqliteChunkStore {
         Ok(())
     }
 
-    fn new_memory() -> Result<Self, sqlite::Error> {
+    pub fn new_memory() -> Result<Self, sqlite::Error> {
         let mut db = sqlite::open(":memory:")?;
+        Self::migrate(&mut db)?;
+        Ok(Self { db })
+    }
+
+    pub fn new_path<T: AsRef<std::path::Path>>(path: T) -> Result<Self, sqlite::Error> {
+        let mut db = sqlite::open(path)?;
         Self::migrate(&mut db)?;
         Ok(Self { db })
     }
 }
 
 impl KelpieChunkStore for SqliteChunkStore {
-    fn get_chunk(series_key: u64, start: u64, stop: u64) -> Option<Chunk> {
-        todo!()
+    fn get_chunk(
+        &self,
+        series_key: i64,
+        start: i64,
+        stop: i64,
+    ) -> Result<Option<Chunk>, GetChunkError> {
+        fn driver(e: sqlite::Error) -> GetChunkError {
+            GetChunkError::Driver(e.into())
+        }
+        let mut statement = self.db.prepare("SELECT start, stop, chunk from chunks WHERE series == ? AND start <= ? AND stop >= ? ORDER BY start DESC").map_err(driver)?;
+
+        statement.bind((1, series_key)).map_err(driver)?;
+        statement.bind((2, start)).map_err(driver)?;
+        statement.bind((3, stop)).map_err(driver)?;
+
+        let mut chunk = None;
+        while let sqlite::State::Row = statement.next().map_err(driver)? {
+            let res_start: i64 = statement.read::<i64, _>("start").map_err(driver)?;
+            let res_stop: i64 = statement.read("stop").map_err(driver)?;
+            dbg!(res_start, res_stop);
+            let res_chunk: Vec<u8> = statement.read("chunk").map_err(driver)?;
+            chunk = Some(Chunk {
+                compressed_data: res_chunk,
+            });
+            break;
+        }
+
+        statement.reset().map_err(driver)?;
+        Ok(chunk)
     }
 
     fn set_chunk(
-        series_key: u64,
-        start: u64,
-        stop: u64,
-        chunk: Chunk,
+        &mut self,
+        series_key: i64,
+        start: i64,
+        stop: i64,
+        chunk: &Chunk,
     ) -> Result<(), SetChunkError> {
-        todo!()
+        fn driver(e: sqlite::Error) -> SetChunkError {
+            SetChunkError::Driver(e.into())
+        }
+        let mut statement = self
+            .db
+            .prepare("INSERT INTO chunks VALUES (?, ?, ?, ?)")
+            .map_err(driver)?;
+        statement.bind((1, series_key)).map_err(driver)?;
+        statement.bind((2, start)).map_err(driver)?;
+        statement.bind((3, stop)).map_err(driver)?;
+        statement
+            .bind((4, chunk.compressed_data.as_slice()))
+            .map_err(driver)?;
+        loop {
+            let state = statement.next().map_err(driver)?;
+            match state {
+                sqlite::State::Row => {}
+                sqlite::State::Done => break,
+            }
+        }
+        statement.reset().map_err(driver)?;
+        Ok(())
     }
 }
 
@@ -176,7 +267,7 @@ pub struct KelpieSeries {
 
 #[cfg(test)]
 mod tests {
-    use crate::{raw_compress, raw_decompress, DataPoint, RawSeries};
+    use crate::{raw_compress, raw_decompress, Chunk, DataPoint, KelpieChunkStore, RawSeries};
 
     #[test]
     fn should_create_sqlite_chunk_store() -> Result<(), Box<dyn std::error::Error>> {
@@ -184,29 +275,161 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn should_store_chunk() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = super::SqliteChunkStore::new_memory()?;
+        let chunk = Chunk {
+            compressed_data: vec![],
+        };
+        store.set_chunk(0, 10, 100, &chunk)?;
+        Ok(())
+    }
+
+    #[test]
+    fn should_not_find_nonexisting_chunk() -> Result<(), Box<dyn std::error::Error>> {
+        let store = super::SqliteChunkStore::new_memory()?;
+        let res = store.get_chunk(0, 10, 100)?;
+        if (res.is_some()) {
+            return Err("there should be no chunk")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn should_retrive_chunk() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = super::SqliteChunkStore::new_memory()?;
+        let chunk = Chunk {
+            compressed_data: vec![],
+        };
+        store.set_chunk(0, 10, 100, &chunk)?;
+        let stored = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
+        if (chunk.compressed_data != stored.compressed_data) {
+            return Err("chunks don't match")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn should_retrive_smallest_chunk() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = super::SqliteChunkStore::new_memory()?;
+
+        store.set_chunk(
+            0,
+            1,
+            9,
+            &Chunk {
+                compressed_data: vec![2],
+            },
+        )?;
+        store.set_chunk(
+            0,
+            0,
+            50,
+            &Chunk {
+                compressed_data: vec![5, 6],
+            },
+        )?;
+        store.set_chunk(
+            0,
+            50,
+            200,
+            &Chunk {
+                compressed_data: vec![5, 6],
+            },
+        )?;
+        store.set_chunk(
+            0,
+            10,
+            100,
+            &Chunk {
+                compressed_data: vec![],
+            },
+        )?;
+        store.set_chunk(
+            0,
+            0,
+            1000,
+            &Chunk {
+                compressed_data: vec![1],
+            },
+        )?;
+        let stored = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
+        if stored.compressed_data != vec![] {
+            return Err("chunks don't match")?;
+        }
+        Ok(())
+    }
+
     fn decompressed_eq_compressed(raw: &RawSeries) -> Result<bool, Box<dyn std::error::Error>> {
         let compressed = raw_compress(raw);
         let decompressed = match raw_decompress(&compressed) {
             Ok(v) => v,
-            Err(e) => return Err("failed to decompress")?,
+            Err(_e) => return Err("failed to decompress")?,
         };
 
+        println!(
+            "raw: {}, compressed: {}, ratio: {}",
+            raw.serial_size_hint(),
+            compressed.len(),
+            compressed.len() as f64 / raw.serial_size_hint() as f64
+        );
         Ok(raw.eq(&decompressed))
     }
 
     #[test]
     fn should_cycle_compression() -> Result<(), Box<dyn std::error::Error>> {
-        let mut series = RawSeries::new();
-        let test_time_secs = 1722180250;
-        for i in 0..3600 * 6 {
-            series.insert(DataPoint {
-                time: (test_time_secs + i) * 1000,
-                value: i as f64 * 100.0,
-            });
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(0xdeadbeef);
+        let mut series = vec![];
+        // float series
+        for _ in 0..20 {
+            let mut serie: RawSeries = RawSeries::new();
+            let num_points: u16 = rng.gen_range(3500..3700);
+            let mut last_time_ms: i64 = 1722180250000;
+            let mut last_val: f64 = rng.gen_range(0.0..100.0);
+            let val_variance: f64 = rng.gen_range(0.01..20.0);
+            for _ in 0..num_points {
+                let time_inc = rng.gen_range(400..1100);
+                last_time_ms += time_inc;
+                let time = last_time_ms;
+                let val_inc = rng.gen_range(-val_variance..val_variance);
+                last_val += val_inc;
+                // truncate precision of floats to simulate less random measurements
+                let value = f64::from_bits(last_val.to_bits() & (!0 << 36));
+                assert!((last_val - value).abs() < 1.0);
+                serie.insert(DataPoint { time, value })
+            }
+            series.push(serie);
         }
-        if !decompressed_eq_compressed(&series)? {
-            Err("not equal")?;
+
+        // int as float series
+        for _ in 0..30 {
+            let mut serie: RawSeries = RawSeries::new();
+            let num_points: u16 = rng.gen_range(3500..3700);
+            let mut last_time_ms: i64 = 1722180250000;
+            let mut last_val: i64 = rng.gen_range(0..100000);
+            let val_variance: i64 = rng.gen_range(10..100);
+            for _ in 0..num_points {
+                let time_inc = rng.gen_range(400..1102);
+                last_time_ms += time_inc;
+                let time = last_time_ms;
+                let val_inc = rng.gen_range(-val_variance..val_variance);
+                last_val += val_inc;
+                serie.insert(DataPoint {
+                    time,
+                    value: last_val as f64,
+                })
+            }
+            series.push(serie);
         }
+
+        for serie in series {
+            if !decompressed_eq_compressed(&serie)? {
+                Err("not equal")?;
+            }
+        }
+
         Ok(())
     }
 
@@ -221,7 +444,7 @@ mod tests {
             });
         }
         let encoded = raw_compress(&series);
-        print!(
+        println!(
             "raw: {}, compressed: {}, ratio: {}",
             series.serial_size_hint(),
             encoded.len(),
