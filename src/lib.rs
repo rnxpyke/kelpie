@@ -32,12 +32,6 @@ impl RawSeries {
     pub fn serial_size_hint(&self) -> usize {
         self.data.len() * (8 * 2)
     }
-
-    pub fn compress(&self) -> Chunk {
-        Chunk {
-            compressed_data: raw_compress(&self),
-        }
-    }
 }
 
 pub enum DecompressError {
@@ -144,6 +138,13 @@ impl Chunk {
     pub fn decompress(&self) -> Result<RawSeries, DecompressError> {
         raw_decompress(&self.compressed_data)
     }
+
+    pub fn compress_series(series: &RawSeries) -> Chunk {
+        let chunk = Chunk {
+            compressed_data: raw_compress(series),
+        };
+        chunk
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -164,7 +165,7 @@ pub trait KelpieChunkStore {
         series_key: i64,
         start: i64,
         stop: i64,
-    ) -> Result<Option<Chunk>, GetChunkError>;
+    ) -> Result<Option<(ChunkMeta, Chunk)>, GetChunkError>;
     fn set_chunk(
         &mut self,
         series_key: i64,
@@ -197,13 +198,20 @@ impl SqliteChunkStore {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct ChunkMeta {
+    series_key: i64,
+    start: i64,
+    stop: i64,
+}
+
 impl KelpieChunkStore for SqliteChunkStore {
     fn get_chunk(
         &self,
         series_key: i64,
         start: i64,
         stop: i64,
-    ) -> Result<Option<Chunk>, GetChunkError> {
+    ) -> Result<Option<(ChunkMeta, Chunk)>, GetChunkError> {
         fn driver(e: sqlite::Error) -> GetChunkError {
             GetChunkError::Driver(e.into())
         }
@@ -213,20 +221,26 @@ impl KelpieChunkStore for SqliteChunkStore {
         statement.bind((2, start)).map_err(driver)?;
         statement.bind((3, stop)).map_err(driver)?;
 
-        let mut chunk = None;
+        let mut res = None;
         while let sqlite::State::Row = statement.next().map_err(driver)? {
             let res_start: i64 = statement.read::<i64, _>("start").map_err(driver)?;
             let res_stop: i64 = statement.read("stop").map_err(driver)?;
             dbg!(res_start, res_stop);
             let res_chunk: Vec<u8> = statement.read("chunk").map_err(driver)?;
-            chunk = Some(Chunk {
+            let meta = ChunkMeta {
+                series_key,
+                start: res_start,
+                stop: res_stop,
+            };
+            let chunk = Chunk {
                 compressed_data: res_chunk,
-            });
+            };
+            res = Some((meta, chunk));
             break;
         }
 
         statement.reset().map_err(driver)?;
-        Ok(chunk)
+        Ok(res)
     }
 
     fn set_chunk(
@@ -302,7 +316,7 @@ mod tests {
             compressed_data: vec![],
         };
         store.set_chunk(0, 10, 100, &chunk)?;
-        let stored = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
+        let (_, stored) = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
         if (chunk.compressed_data != stored.compressed_data) {
             return Err("chunks don't match")?;
         }
@@ -353,7 +367,7 @@ mod tests {
                 compressed_data: vec![1],
             },
         )?;
-        let stored = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
+        let (_, stored) = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
         if stored.compressed_data != vec![] {
             return Err("chunks don't match")?;
         }
