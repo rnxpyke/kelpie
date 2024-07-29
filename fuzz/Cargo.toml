@@ -1,0 +1,29 @@
+[package]
+name = "kelpie-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+
+[dependencies.kelpie]
+path = ".."
+
+[[bin]]
+name = "fuzz_target_1"
+path = "fuzz_targets/fuzz_target_1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kelpie_matches_fake"
+path = "fuzz_targets/kelpie_matches_fake.rs"
+test = false
+doc = false
+bench = false
+

@@ -8,7 +8,10 @@ extern crate quickcheck;
 #[macro_use]
 extern crate quickcheck_macros;
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    i64,
+};
 
 pub use series::{Chunk, DataPoint, DecompressError, RawSeries};
 pub use store::{ChunkMeta, GetChunkError, KelpieChunkStore, SetChunkError, SqliteChunkStore};
@@ -104,6 +107,17 @@ impl KelpieFake {
     }
 
     pub fn insert(&mut self, series_key: i64, data_point: DataPoint) {
+        if data_point.value.is_nan() {
+            return;
+        }
+        if data_point.time < 0 {
+            return;
+        }
+        // because we work with exclusive ranges in the other impl, we skip here
+        // we don't want to hit max timestamps anyways
+        if data_point.time == i64::MAX {
+            return;
+        }
         let series = self.series.entry(series_key).or_default();
         series.data.insert(data_point.time, data_point.value);
     }
@@ -248,9 +262,20 @@ impl Kelpie {
     }
 
     pub fn insert(&mut self, series_key: i64, data_point: DataPoint) {
+        if data_point.value.is_nan() {
+            return;
+        }
+        if data_point.time < 0 {
+            return;
+        }
+        // skip max value because last chunk will go from last_multiple to max_value exclusive,
+        // so we can never store max value
+        if data_point.time == i64::MAX {
+            return;
+        }
         self.ensure_series_for(series_key, data_point.time);
         let series = self.series.get_mut(&series_key).unwrap();
-        series.try_insert(data_point);
+        assert!(series.try_insert(data_point));
     }
 }
 
@@ -586,8 +611,177 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn should_survie_fuzz1_test() -> Result<(), Box<dyn std::error::Error>> {
+        use Cmd::*;
+        let cmds = vec![
+            Insert {
+                series_key: -1,
+                point: DataPoint {
+                    time: -1,
+                    value: -8.914951611789743e303,
+                },
+            },
+            Query {
+                series_key: -1,
+                start: -1,
+                stop: 0,
+            },
+        ];
+        kelpie_eq_fake(&cmds)?;
+        Ok(())
+    }
+
+    #[test]
+    fn should_survie_fuzz2_test() -> Result<(), Box<dyn std::error::Error>> {
+        use Cmd::*;
+        let cmds = vec![Insert {
+            series_key: -1086626725888,
+            point: DataPoint {
+                time: 9223372036854775807,
+                value: 1.22e-321,
+            },
+        }];
+        kelpie_eq_fake(&cmds)?;
+        Ok(())
+    }
+
     #[quickcheck]
     fn matches_fake(cmds: Vec<Cmd>) -> bool {
         kelpie_eq_fake(&cmds).is_ok()
+    }
+
+    /*
+
+    */
+
+    #[test]
+    fn input1_that_kills_qcompress() {
+        use Cmd::*;
+        type Point = DataPoint;
+        let cmds = vec![
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493674201707,
+                    value: 4.2984146959204563e204,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493674204011,
+                    value: 2.773899791842187e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398491872002156,
+                    value: 2.8170090551184303e209,
+                },
+            },
+            Insert {
+                series_key: 5620482900717431659,
+                point: Point {
+                    time: -36028800961207809,
+                    value: 9.585785089134067e247,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493673548651,
+                    value: 2.8170090551184303e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493669550955,
+                    value: 2.8170090551184303e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493674202475,
+                    value: 2.8170090551184244e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 39806716479236971,
+                    value: 5.41582490789e-312,
+                },
+            },
+        ];
+        kelpie_eq_fake(&cmds).unwrap();
+    }
+
+    #[test]
+    fn input2_that_kills_qcompress() {
+        use Cmd::*;
+        type Point = DataPoint;
+        let cmds = vec![
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493674206059,
+                    value: 2.817009055114319e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493674192235,
+                    value: 2.8169933786932377e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493674189409,
+                    value: 2.8170090551184303e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493674203951,
+                    value: 2.8170090551184303e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493674204011,
+                    value: -2.8170090551184303e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493683941375,
+                    value: 2.8170200837294834e209,
+                },
+            },
+            Insert {
+                series_key: 7740398493674204011,
+                point: Point {
+                    time: 7740398493674204011,
+                    value: 2.8170090551184303e209,
+                },
+            },
+            Insert {
+                series_key: 0,
+                point: Point {
+                    time: 0,
+                    value: 0.0,
+                },
+            },
+        ];
+        kelpie_eq_fake(&cmds).unwrap();
     }
 }
