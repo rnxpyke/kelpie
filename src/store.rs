@@ -34,7 +34,7 @@ pub struct SqliteChunkStore {
 
 impl SqliteChunkStore {
     fn migrate(db: &mut sqlite::Connection) -> Result<(), sqlite::Error> {
-        db.execute("CREATE TABLE IF NOT EXISTS chunks (series INTEGER, start INTEGER, stop INTEGER, chunk BLOB)")?;
+        db.execute("CREATE TABLE IF NOT EXISTS chunks (series INTEGER, start INTEGER, stop INTEGER, chunk BLOB, UNIQUE (series, start, stop))")?;
         Ok(())
     }
 
@@ -78,7 +78,6 @@ impl KelpieChunkStore for SqliteChunkStore {
         if let sqlite::State::Row = statement.next().map_err(driver)? {
             let res_start: i64 = statement.read::<i64, _>("start").map_err(driver)?;
             let res_stop: i64 = statement.read("stop").map_err(driver)?;
-            dbg!(res_start, res_stop);
             let res_chunk: Vec<u8> = statement.read("chunk").map_err(driver)?;
             let meta = ChunkMeta {
                 series_key,
@@ -107,7 +106,7 @@ impl KelpieChunkStore for SqliteChunkStore {
         }
         let mut statement = self
             .db
-            .prepare("INSERT INTO chunks VALUES (?, ?, ?, ?)")
+            .prepare("INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?)")
             .map_err(driver)?;
         statement.bind((1, series_key)).map_err(driver)?;
         statement.bind((2, start)).map_err(driver)?;
@@ -217,6 +216,41 @@ mod tests {
         )?;
         let (_, stored) = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
         if stored.compressed_data != vec![] {
+            Err("chunks don't match")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn should_allow_storing_dupes() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = super::SqliteChunkStore::new_memory()?;
+
+        store.set_chunk(
+            0,
+            0,
+            100,
+            &Chunk {
+                compressed_data: vec![0],
+            },
+        )?;
+        store.set_chunk(
+            0,
+            0,
+            100,
+            &Chunk {
+                compressed_data: vec![1],
+            },
+        )?;
+        store.set_chunk(
+            0,
+            0,
+            100,
+            &Chunk {
+                compressed_data: vec![2],
+            },
+        )?;
+        let (_, stored) = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
+        if stored.compressed_data != vec![2] {
             Err("chunks don't match")?;
         }
         Ok(())
