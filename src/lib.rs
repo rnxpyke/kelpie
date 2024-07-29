@@ -8,15 +8,17 @@ extern crate quickcheck;
 #[macro_use]
 extern crate quickcheck_macros;
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::RangeBounds,
+};
 
 pub use series::{Chunk, DataPoint, DecompressError, RawSeries};
 pub use store::{ChunkMeta, GetChunkError, KelpieChunkStore, SetChunkError, SqliteChunkStore};
 
 #[derive(Debug)]
 pub struct Series {
-    schedule: Option<Schedule>,
-    schedule_config: ScheduleConfig,
+    schedule: Schedule,
     data: RawSeries,
 }
 
@@ -24,6 +26,12 @@ pub struct Series {
 pub struct Schedule {
     chunk_start: i64,
     chunk_end: i64,
+}
+
+impl Schedule {
+    fn contains(&self, time: i64) -> bool {
+        return (self.chunk_start..self.chunk_end).contains(&time);
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -67,32 +75,17 @@ pub enum InsertStatus {
 }
 
 impl Series {
-    fn new(config: ScheduleConfig) -> Self {
+    fn new(schedule: Schedule) -> Self {
         let data = RawSeries::new();
-        Self {
-            data,
-            schedule: None,
-            schedule_config: config,
-        }
+        Self { data, schedule }
     }
 
-    fn insert(&mut self, data_point: DataPoint) -> InsertStatus {
-        const EXPECT_MSG: &str = "We just inserted a data point, this can't be emtpy";
-        self.data.insert(data_point);
-        let first_time = self.data.first_time().expect(EXPECT_MSG);
-        if self.schedule.is_none() {
-            self.schedule = Some(self.schedule_config.init_schedule_from_time(first_time));
+    fn try_insert(&mut self, data_point: DataPoint) -> bool {
+        if (self.schedule.contains(data_point.time)) {
+            self.data.insert(data_point);
+            return true;
         }
-        let last_time = self.data.last_time().expect(EXPECT_MSG);
-        let schedule = self.schedule.expect(EXPECT_MSG);
-        if last_time
-            > schedule
-                .chunk_end
-                .saturating_add(self.schedule_config.compact_after)
-        {
-            return InsertStatus::CompactmentPending(schedule);
-        }
-        InsertStatus::Cached
+        return false;
     }
 }
 
@@ -155,7 +148,7 @@ impl Kelpie {
         })
     }
 
-    pub fn query_closest_chunk(
+    pub fn query_exact_chunk(
         &self,
         series_key: i64,
         start: i64,
@@ -163,19 +156,15 @@ impl Kelpie {
     ) -> Result<Option<(ChunkMeta, RawSeries)>, GetChunkError> {
         // check cache first
         if let Some(series) = self.series.get(&series_key) {
-            if let Some(schedule) = series.schedule {
-                if schedule.chunk_start <= start && schedule.chunk_end >= start {
-                    let end = std::cmp::min(stop, schedule.chunk_end);
-                    let meta = ChunkMeta {
-                        series_key,
-                        start,
-                        stop: end,
-                    };
-                    let range = series.data.data.range(start..end);
-                    let map = BTreeMap::from_iter(range.map(|(&k, &v)| (k, v)));
-                    let series = RawSeries { data: map };
-                    return Ok(Some((meta, series)));
-                }
+            // end checks should not be required because constant chunk siszes
+            if series.schedule.chunk_start == start {
+                let meta = ChunkMeta {
+                    series_key,
+                    start,
+                    stop,
+                };
+                let series = series.data.clone();
+                return Ok(Some((meta, series)));
             }
         }
 
@@ -192,20 +181,17 @@ impl Kelpie {
         start: i64,
         stop: i64,
     ) -> Result<RawSeries, GetChunkError> {
+        dbg!(&self.series);
         let mut map = BTreeMap::new();
         let mut cur_start = start;
         while cur_start < stop {
             let cur_chunk = self.schedule_config.init_schedule_from_time(cur_start);
             let closest =
-                self.query_closest_chunk(series_key, cur_chunk.chunk_start, cur_chunk.chunk_end)?;
+                self.query_exact_chunk(series_key, cur_chunk.chunk_start, cur_chunk.chunk_end)?;
             match closest {
-                Some((meta, mut chunk)) => {
+                Some((_meta, mut chunk)) => {
                     map.append(&mut chunk.data);
-                    cur_start = if meta.stop <= cur_start {
-                        cur_chunk.chunk_end
-                    } else {
-                        meta.stop
-                    };
+                    cur_start = cur_chunk.chunk_end;
                 }
                 None => cur_start = cur_chunk.chunk_end,
             }
@@ -226,56 +212,55 @@ impl Kelpie {
         })
     }
 
-    fn compact(&mut self, series_key: i64, schedule: Schedule) -> Result<(), SetChunkError> {
-        let series = if let Some(s) = self.series.get_mut(&series_key) {
-            s
-        } else {
-            return Ok(());
+    fn save_series(&mut self, series_key: i64) {
+        let Some(series) = self.series.remove(&series_key) else {
+            return;
         };
-
-        let mut early_vals = {
-            // after this, retained contains all keys >= schedule.chunk_end,
-            // while the original series contains everything before.
-            // therefore, we swap retained and series value to get everything old
-            let mut retained = series.data.data.split_off(&schedule.chunk_end);
-            std::mem::swap(&mut retained, &mut series.data.data);
-            retained
-        };
-
-        // early vals is now every value with time < chunk_end.
-        // it may still contain data that is before chunk start.
-        // TODO: compact early data correctly.
-
-        // Drop early values for now
-        early_vals.retain(|&k, _v| k >= schedule.chunk_start);
-
-        // set new schedule for remaining data
-        if let Some(first_time) = series.data.first_time() {
-            series.schedule = Some(self.schedule_config.init_schedule_from_time(first_time));
-        }
-
-        // compress chunk
-        let chunk_series = RawSeries { data: early_vals };
-        let chunk = Chunk::compress_series(&chunk_series);
-        drop(chunk_series);
-
-        // store chunk
+        let chunk = Chunk::compress_series(&series.data);
+        let Schedule {
+            chunk_start: start,
+            chunk_end: stop,
+        } = series.schedule;
         self.chunk_store
-            .set_chunk(series_key, schedule.chunk_start, schedule.chunk_end, &chunk)?;
-        Ok(())
+            .set_chunk(series_key, start, stop, &chunk)
+            .unwrap();
+    }
+
+    fn load_series(&mut self, series_key: i64, schedule: Schedule) {
+        self.save_series(series_key);
+        let chunk_res = self
+            .chunk_store
+            .get_chunk(series_key, schedule.chunk_start, schedule.chunk_end)
+            .unwrap();
+        match chunk_res {
+            Some((_meta, chunk)) => {
+                let raw_series = chunk.decompress().unwrap();
+                let series = Series {
+                    schedule,
+                    data: raw_series,
+                };
+                self.series.insert(series_key, series);
+            }
+            None => {
+                self.series.insert(series_key, Series::new(schedule));
+            }
+        }
+    }
+
+    fn ensure_series_for(&mut self, series_key: i64, time: i64) {
+        if let Some(series) = self.series.get_mut(&series_key) {
+            if series.schedule.contains(time) {
+                return;
+            }
+        }
+        let schedule = self.schedule_config.init_schedule_from_time(time);
+        self.load_series(series_key, schedule);
     }
 
     pub fn insert(&mut self, series_key: i64, data_point: DataPoint) {
-        let series = self
-            .series
-            .entry(series_key)
-            .or_insert_with(|| Series::new(self.schedule_config));
-        match series.insert(data_point) {
-            InsertStatus::Cached => {}
-            InsertStatus::CompactmentPending(schedule) => {
-                self.compact(series_key, schedule).unwrap()
-            }
-        };
+        self.ensure_series_for(series_key, data_point.time);
+        let series = self.series.get_mut(&series_key).unwrap();
+        series.try_insert(data_point);
     }
 }
 

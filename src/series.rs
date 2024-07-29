@@ -30,7 +30,7 @@ impl Arbitrary for DataPoint {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct RawSeries {
     pub(crate) data: BTreeMap<i64, f64>,
 }
