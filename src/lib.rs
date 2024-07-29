@@ -77,7 +77,7 @@ impl Series {
     }
 
     fn insert(&mut self, data_point: DataPoint) -> InsertStatus {
-        const EXPECT_MSG: &'static str = "We just inserted a data point, this can't be emtpy";
+        const EXPECT_MSG: &str = "We just inserted a data point, this can't be emtpy";
         self.data.insert(data_point);
         let first_time = self.data.first_time().expect(EXPECT_MSG);
         if self.schedule.is_none() {
@@ -92,7 +92,7 @@ impl Series {
         {
             return InsertStatus::CompactmentPending(schedule);
         }
-        return InsertStatus::Cached;
+        InsertStatus::Cached
     }
 }
 
@@ -104,6 +104,12 @@ pub struct Kelpie {
 
 pub struct KelpieFake {
     series: HashMap<i64, RawSeries>,
+}
+
+impl Default for KelpieFake {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KelpieFake {
@@ -134,7 +140,7 @@ impl KelpieFake {
         };
         let range = series.data.range(start..stop);
         let map = BTreeMap::from_iter(range.map(|(&k, &v)| (k, v)));
-        return Ok(RawSeries { data: map });
+        Ok(RawSeries { data: map })
     }
 }
 
@@ -177,7 +183,7 @@ impl Kelpie {
             let series = chunk.decompress().unwrap();
             return Ok(Some((meta, series)));
         }
-        return Ok(None);
+        Ok(None)
     }
 
     pub fn query(
@@ -390,12 +396,12 @@ mod tests {
         let mut kelpie = Kelpie::new_memory()?;
         let mut fake = KelpieFake::new();
         for cmd in cmds {
-            match cmd {
-                &Cmd::Insert { series_key, point } => {
+            match *cmd {
+                Cmd::Insert { series_key, point } => {
                     kelpie.insert(series_key, point);
                     fake.insert(series_key, point);
                 }
-                &Cmd::Query {
+                Cmd::Query {
                     series_key,
                     start,
                     stop,
@@ -404,7 +410,7 @@ mod tests {
                     let fake_res = fake.query(series_key, start, stop)?;
                     dbg!(&kelpie_res, &fake_res);
                     if kelpie_res != fake_res {
-                        return Err("not matching")?;
+                        Err("not matching")?;
                     }
                 }
             }
@@ -463,13 +469,13 @@ mod tests {
                     stop: x + 1,
                 },
             ];
-            return cmds;
+            cmds
         }
 
         let point = 3600000;
 
         kelpie_eq_fake(&make_cmds(point - 1))?;
-        kelpie_eq_fake(&make_cmds(point + 0))?;
+        kelpie_eq_fake(&make_cmds(point))?;
         kelpie_eq_fake(&make_cmds(point + 1))?;
         Ok(())
     }
@@ -493,12 +499,12 @@ mod tests {
                     stop: 10000000,
                 },
             ];
-            return cmds;
+            cmds
         }
 
         kelpie_eq_fake(&make_cmds(3600000 - 100))?;
         kelpie_eq_fake(&make_cmds(3600000 - 1))?;
-        kelpie_eq_fake(&make_cmds(3600000 + 0))?;
+        kelpie_eq_fake(&make_cmds(3600000))?;
         kelpie_eq_fake(&make_cmds(3600000 + 1))?;
         kelpie_eq_fake(&make_cmds(3600000 + 100))?;
         Ok(())
@@ -540,7 +546,7 @@ mod tests {
                     stop: x + 1,
                 },
             ];
-            return cmds;
+            cmds
         }
 
         kelpie_eq_fake(&make_cmds(0))?;
@@ -549,7 +555,7 @@ mod tests {
         kelpie_eq_fake(&make_cmds(100))?;
         kelpie_eq_fake(&make_cmds(1000))?;
         kelpie_eq_fake(&make_cmds(3600000 - 1))?;
-        kelpie_eq_fake(&make_cmds(3600000 + 0))?;
+        kelpie_eq_fake(&make_cmds(3600000))?;
         kelpie_eq_fake(&make_cmds(3600000 + 1))?;
         kelpie_eq_fake(&make_cmds(3600000 * 2))?;
         Ok(())
@@ -591,7 +597,7 @@ mod tests {
                     stop: 1,
                 },
             ];
-            return cmds;
+            cmds
         }
 
         kelpie_eq_fake(&make_cmds(0))?;
@@ -600,7 +606,7 @@ mod tests {
         kelpie_eq_fake(&make_cmds(100))?;
         kelpie_eq_fake(&make_cmds(1000))?;
         kelpie_eq_fake(&make_cmds(3600000 - 1))?;
-        kelpie_eq_fake(&make_cmds(3600000 + 0))?;
+        kelpie_eq_fake(&make_cmds(3600000))?;
         kelpie_eq_fake(&make_cmds(3600000 + 1))?;
         kelpie_eq_fake(&make_cmds(3600000 * 2))?;
         Ok(())
