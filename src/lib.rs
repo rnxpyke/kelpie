@@ -8,10 +8,7 @@ extern crate quickcheck;
 #[macro_use]
 extern crate quickcheck_macros;
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    ops::RangeBounds,
-};
+use std::collections::{BTreeMap, HashMap};
 
 pub use series::{Chunk, DataPoint, DecompressError, RawSeries};
 pub use store::{ChunkMeta, GetChunkError, KelpieChunkStore, SetChunkError, SqliteChunkStore};
@@ -30,7 +27,7 @@ pub struct Schedule {
 
 impl Schedule {
     fn contains(&self, time: i64) -> bool {
-        return (self.chunk_start..self.chunk_end).contains(&time);
+        (self.chunk_start..self.chunk_end).contains(&time)
     }
 }
 
@@ -41,18 +38,12 @@ pub struct ScheduleConfig {
     // values between s..s+c
     // should never be negative
     chunk_size: i64,
-
-    // how long to wait before compacting the series
-    // also in key space
-    // should never be negative
-    compact_after: i64,
 }
 
 impl Default for ScheduleConfig {
     fn default() -> Self {
         Self {
             chunk_size: 60 * 60 * 1000,
-            compact_after: 15 * 60 * 1000,
         }
     }
 }
@@ -81,11 +72,11 @@ impl Series {
     }
 
     fn try_insert(&mut self, data_point: DataPoint) -> bool {
-        if (self.schedule.contains(data_point.time)) {
+        if self.schedule.contains(data_point.time) {
             self.data.insert(data_point);
             return true;
         }
-        return false;
+        false
     }
 }
 
