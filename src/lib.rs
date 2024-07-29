@@ -172,7 +172,6 @@ impl Kelpie {
         start: i64,
         stop: i64,
     ) -> Result<RawSeries, GetChunkError> {
-        dbg!(&self.series);
         let mut map = BTreeMap::new();
         let mut cur_start = start;
         while cur_start < stop {
@@ -384,7 +383,6 @@ mod tests {
                 } => {
                     let kelpie_res = kelpie.query(series_key, start, stop)?;
                     let fake_res = fake.query(series_key, start, stop)?;
-                    dbg!(&kelpie_res, &fake_res);
                     if kelpie_res != fake_res {
                         Err("not matching")?;
                     }
@@ -590,7 +588,6 @@ mod tests {
 
     #[quickcheck]
     fn matches_fake(cmds: Vec<Cmd>) -> bool {
-        dbg!(cmds.len());
         kelpie_eq_fake(&cmds).is_ok()
     }
 }
