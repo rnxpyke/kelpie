@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 q_compress = "0.11.7"
-sqlite = "0.36.0"
+sqlite = { version = "0.36.0", features = ["bundled"], default-features = false }
+sqlite3-sys = { version = "0.17.0", features = ["bundled"], default-features = false }
 thiserror = "1.0.63"
 
 [dev-dependencies]

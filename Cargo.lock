@@ -32,6 +32,7 @@ dependencies = [
  "q_compress",
  "rand",
  "sqlite",
+ "sqlite3-sys",
  "thiserror",
 ]
 

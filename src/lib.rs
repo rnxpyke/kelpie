@@ -1,469 +1,658 @@
-use std::{collections::BTreeMap, io::Write};
+pub mod series;
+pub mod store;
 
-use q_compress::{errors::QCompressError, Decompressor, DecompressorConfig};
+use std::{
+    collections::{BTreeMap, HashMap},
+    hash::Hash,
+};
 
-pub struct DataPoint {
-    time: i64,
-    value: f64,
-}
+pub use series::{Chunk, DataPoint, DecompressError, RawSeries};
+pub use store::{ChunkMeta, GetChunkError, KelpieChunkStore, SetChunkError, SqliteChunkStore};
 
-#[derive(Debug, PartialEq)]
-pub struct RawSeries {
-    data: BTreeMap<i64, f64>,
-}
-
-impl Default for RawSeries {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RawSeries {
-    pub fn new() -> Self {
-        RawSeries {
-            data: BTreeMap::new(),
-        }
-    }
-
-    pub fn insert(&mut self, point: DataPoint) {
-        self.data.insert(point.time, point.value);
-    }
-
-    pub fn serial_size_hint(&self) -> usize {
-        self.data.len() * (8 * 2)
-    }
-}
-
-pub enum DecompressError {
-    TimeHeaderMissing,
-    TimesMissing,
-    ValHeaderMissing,
-    ValsMissing,
-    DecompressError(QCompressError),
-}
-
-impl From<QCompressError> for DecompressError {
-    fn from(value: QCompressError) -> Self {
-        Self::DecompressError(value)
-    }
-}
-
-fn raw_decompress(bytes: &[u8]) -> Result<RawSeries, DecompressError> {
-    if bytes.len() < 8 {
-        return Err(DecompressError::TimeHeaderMissing);
-    }
-    let times_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
-    let times_end = times_len + 8;
-    if bytes.len() < times_end {
-        return Err(DecompressError::TimesMissing);
-    }
-    let compressed_times = &bytes[8..(8 + times_len)];
-    if bytes.len() - times_end < 8 {
-        return Err(DecompressError::ValHeaderMissing);
-    }
-    let vals_len =
-        u64::from_le_bytes(bytes[times_end..(times_end + 8)].try_into().unwrap()) as usize;
-    let vals_end = times_end + vals_len + 8;
-    if bytes.len() < vals_end {
-        return Err(DecompressError::ValsMissing);
-    };
-    let compressed_vals = &bytes[(times_end + 8)..vals_end];
-
-    let times = {
-        let mut decompressor: Decompressor<i64> =
-            q_compress::Decompressor::from_config(DecompressorConfig::default());
-        decompressor.write_all(compressed_times).unwrap();
-        decompressor.simple_decompress()?
-    };
-
-    let values = {
-        let mut decompressor: Decompressor<f64> =
-            q_compress::Decompressor::from_config(DecompressorConfig::default());
-        decompressor.write_all(compressed_vals).unwrap();
-        decompressor.simple_decompress()?
-    };
-
-    let mut series = RawSeries::new();
-    let mut i = 0;
-    loop {
-        if i >= times.len() {
-            break;
-        }
-        if i >= values.len() {
-            break;
-        }
-        series.insert(DataPoint {
-            time: times[i],
-            value: values[i],
-        });
-        i += 1;
-    }
-    Ok(series)
-}
-
-fn raw_compress(raw: &RawSeries) -> Vec<u8> {
-    use q_compress::CompressorConfig;
-    let compressed_times = {
-        let cfg = CompressorConfig::default()
-            .with_use_gcds(false)
-            .with_compression_level(8)
-            .with_delta_encoding_order(2);
-        let timevec: Vec<i64> = raw.data.keys().copied().collect();
-
-        q_compress::Compressor::from_config(cfg).simple_compress(&timevec)
-    };
-    let compressed_vals = {
-        let cfg = CompressorConfig::default()
-            .with_use_gcds(false)
-            .with_delta_encoding_order(1)
-            .with_compression_level(8);
-        let timevec: Vec<f64> = raw.data.values().copied().collect();
-
-        q_compress::Compressor::from_config(cfg).simple_compress(&timevec)
-    };
-    let mut res = vec![0u8; compressed_times.len() + 8 + compressed_vals.len() + 8];
-    res[0..8].copy_from_slice(&compressed_times.len().to_le_bytes());
-    let times_end = 8 + compressed_times.len();
-    res[8..times_end].copy_from_slice(&compressed_times);
-    res[times_end..(times_end + 8)].copy_from_slice(&compressed_vals.len().to_le_bytes());
-    res[(times_end + 8)..].copy_from_slice(&compressed_vals);
-    res
-}
-
-pub struct Chunk {
-    pub(crate) compressed_data: Vec<u8>,
-}
-
-impl Chunk {
-    pub fn decompress(&self) -> Result<RawSeries, DecompressError> {
-        raw_decompress(&self.compressed_data)
-    }
-
-    pub fn compress_series(series: &RawSeries) -> Chunk {
-        let chunk = Chunk {
-            compressed_data: raw_compress(series),
-        };
-        chunk
-    }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum SetChunkError {
-    #[error("Driver error")]
-    Driver(#[from] Box<dyn std::error::Error>),
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum GetChunkError {
-    #[error("Driver error")]
-    Driver(#[from] Box<dyn std::error::Error>),
-}
-
-pub trait KelpieChunkStore {
-    fn get_chunk(
-        &self,
-        series_key: i64,
-        start: i64,
-        stop: i64,
-    ) -> Result<Option<(ChunkMeta, Chunk)>, GetChunkError>;
-    fn set_chunk(
-        &mut self,
-        series_key: i64,
-        start: i64,
-        stop: i64,
-        chunk: &Chunk,
-    ) -> Result<(), SetChunkError>;
-}
-
-pub struct SqliteChunkStore {
-    db: sqlite::Connection,
-}
-
-impl SqliteChunkStore {
-    fn migrate(db: &mut sqlite::Connection) -> Result<(), sqlite::Error> {
-        db.execute("CREATE TABLE IF NOT EXISTS chunks (series INTEGER, start INTEGER, stop INTEGER, chunk BLOB)")?;
-        Ok(())
-    }
-
-    pub fn new_memory() -> Result<Self, sqlite::Error> {
-        let mut db = sqlite::open(":memory:")?;
-        Self::migrate(&mut db)?;
-        Ok(Self { db })
-    }
-
-    pub fn new_path<T: AsRef<std::path::Path>>(path: T) -> Result<Self, sqlite::Error> {
-        let mut db = sqlite::open(path)?;
-        Self::migrate(&mut db)?;
-        Ok(Self { db })
-    }
+pub struct Series {
+    schedule: Option<Schedule>,
+    schedule_config: ScheduleConfig,
+    data: RawSeries,
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct ChunkMeta {
-    series_key: i64,
-    start: i64,
-    stop: i64,
+pub struct Schedule {
+    chunk_start: i64,
+    chunk_end: i64,
 }
 
-impl KelpieChunkStore for SqliteChunkStore {
-    fn get_chunk(
+#[derive(Copy, Clone, Debug)]
+pub struct ScheduleConfig {
+    // the chunk size in key space.
+    // a chunk with chunk_size c and start s contains
+    // values between s..s+c
+    // should never be negative
+    chunk_size: i64,
+
+    // how long to wait before compacting the series
+    // also in key space
+    // should never be negative
+    compact_after: i64,
+}
+
+impl Default for ScheduleConfig {
+    fn default() -> Self {
+        Self {
+            chunk_size: 60 * 60 * 1000,
+            compact_after: 15 * 60 * 1000,
+        }
+    }
+}
+
+impl ScheduleConfig {
+    fn init_schedule_from_time(&self, point: i64) -> Schedule {
+        // implicitly round down
+        let chunk_start = point / self.chunk_size;
+        let chunk_end = chunk_start + self.chunk_size;
+        Schedule {
+            chunk_start,
+            chunk_end,
+        }
+    }
+}
+
+pub enum InsertStatus {
+    CompactmentPending(Schedule),
+    Cached,
+}
+
+impl Series {
+    fn new(config: ScheduleConfig) -> Self {
+        let data = RawSeries::new();
+        Self {
+            data,
+            schedule: None,
+            schedule_config: config,
+        }
+    }
+
+    fn insert(&mut self, data_point: DataPoint) -> InsertStatus {
+        const EXPECT_MSG: &'static str = "We just inserted a data point, this can't be emtpy";
+        self.data.insert(data_point);
+        let first_time = self.data.first_time().expect(EXPECT_MSG);
+        if self.schedule.is_none() {
+            self.schedule = Some(self.schedule_config.init_schedule_from_time(first_time));
+        }
+        let last_time = self.data.last_time().expect(EXPECT_MSG);
+        let schedule = self.schedule.expect(EXPECT_MSG);
+        if last_time > schedule.chunk_end + self.schedule_config.compact_after {
+            return InsertStatus::CompactmentPending(schedule);
+        }
+        return InsertStatus::Cached;
+    }
+}
+
+pub struct Kelpie {
+    chunk_store: SqliteChunkStore,
+    series: HashMap<i64, Series>,
+    schedule_config: ScheduleConfig,
+}
+
+pub struct KelpieFake {
+    series: HashMap<i64, RawSeries>,
+}
+
+impl KelpieFake {
+    pub fn new() -> Self {
+        Self {
+            series: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, series_key: i64, data_point: DataPoint) {
+        let series = self.series.entry(series_key).or_default();
+        series.data.insert(data_point.time, data_point.value);
+    }
+
+    pub fn query(
         &self,
         series_key: i64,
         start: i64,
         stop: i64,
-    ) -> Result<Option<(ChunkMeta, Chunk)>, GetChunkError> {
-        fn driver(e: sqlite::Error) -> GetChunkError {
-            GetChunkError::Driver(e.into())
-        }
-        let mut statement = self.db.prepare("SELECT start, stop, chunk from chunks WHERE series == ? AND start <= ? AND stop >= ? ORDER BY start DESC").map_err(driver)?;
-
-        statement.bind((1, series_key)).map_err(driver)?;
-        statement.bind((2, start)).map_err(driver)?;
-        statement.bind((3, stop)).map_err(driver)?;
-
-        let mut res = None;
-        while let sqlite::State::Row = statement.next().map_err(driver)? {
-            let res_start: i64 = statement.read::<i64, _>("start").map_err(driver)?;
-            let res_stop: i64 = statement.read("stop").map_err(driver)?;
-            dbg!(res_start, res_stop);
-            let res_chunk: Vec<u8> = statement.read("chunk").map_err(driver)?;
-            let meta = ChunkMeta {
-                series_key,
-                start: res_start,
-                stop: res_stop,
-            };
-            let chunk = Chunk {
-                compressed_data: res_chunk,
-            };
-            res = Some((meta, chunk));
-            break;
-        }
-
-        statement.reset().map_err(driver)?;
-        Ok(res)
-    }
-
-    fn set_chunk(
-        &mut self,
-        series_key: i64,
-        start: i64,
-        stop: i64,
-        chunk: &Chunk,
-    ) -> Result<(), SetChunkError> {
-        fn driver(e: sqlite::Error) -> SetChunkError {
-            SetChunkError::Driver(e.into())
-        }
-        let mut statement = self
-            .db
-            .prepare("INSERT INTO chunks VALUES (?, ?, ?, ?)")
-            .map_err(driver)?;
-        statement.bind((1, series_key)).map_err(driver)?;
-        statement.bind((2, start)).map_err(driver)?;
-        statement.bind((3, stop)).map_err(driver)?;
-        statement
-            .bind((4, chunk.compressed_data.as_slice()))
-            .map_err(driver)?;
-        loop {
-            let state = statement.next().map_err(driver)?;
-            match state {
-                sqlite::State::Row => {}
-                sqlite::State::Done => break,
-            }
-        }
-        statement.reset().map_err(driver)?;
-        Ok(())
+    ) -> Result<RawSeries, GetChunkError> {
+        let series = if let Some(s) = self.series.get(&series_key) {
+            s
+        } else {
+            return Ok(RawSeries::new());
+        };
+        let range = series.data.range(start..stop);
+        let map = BTreeMap::from_iter(range.map(|(&k, &v)| (k, v)));
+        return Ok(RawSeries { data: map });
     }
 }
 
-pub struct KelpieSeries {
-    start_timestamp: u64,
+impl Kelpie {
+    pub fn new_memory() -> Result<Self, sqlite::Error> {
+        let chunk_store = SqliteChunkStore::new_memory()?;
+        let series = HashMap::new();
+        Ok(Self {
+            chunk_store,
+            series,
+            schedule_config: ScheduleConfig::default(),
+        })
+    }
+
+    pub fn query_closest_chunk(
+        &self,
+        series_key: i64,
+        start: i64,
+        stop: i64,
+    ) -> Result<Option<(ChunkMeta, RawSeries)>, GetChunkError> {
+        // check cache first
+        if let Some(series) = self.series.get(&series_key) {
+            if let Some(schedule) = series.schedule {
+                if schedule.chunk_start <= start && schedule.chunk_end >= start {
+                    let end = std::cmp::min(stop, schedule.chunk_end);
+                    let meta = ChunkMeta {
+                        series_key,
+                        start,
+                        stop: end,
+                    };
+                    let range = series.data.data.range(start..end);
+                    let map = BTreeMap::from_iter(range.map(|(&k, &v)| (k, v)));
+                    let series = RawSeries { data: map };
+                    return Ok(Some((meta, series)));
+                }
+            }
+        }
+
+        if let Some((meta, chunk)) = self.chunk_store.get_chunk(series_key, start, stop)? {
+            let series = chunk.decompress().unwrap();
+            return Ok(Some((meta, series)));
+        }
+        return Ok(None);
+    }
+
+    pub fn query(
+        &self,
+        series_key: i64,
+        start: i64,
+        stop: i64,
+    ) -> Result<RawSeries, GetChunkError> {
+        let mut map = BTreeMap::new();
+        let mut cur_start = start;
+        while cur_start < stop {
+            match self.query_closest_chunk(series_key, cur_start, stop)? {
+                Some((meta, mut chunk)) => {
+                    map.append(&mut chunk.data);
+                    // this should not happen, this break is just here to prevent infinite loops,
+                    // maybe turn into error
+                    if meta.stop <= cur_start {
+                        break;
+                    }
+                    cur_start = meta.stop;
+                }
+                None => break,
+            }
+        }
+
+        Ok(RawSeries { data: map })
+    }
+
+    pub fn new_path<A: AsRef<std::path::Path>>(path: A) -> Result<Self, sqlite::Error> {
+        let chunk_store = SqliteChunkStore::new_path(path)?;
+        let series = HashMap::new();
+        Ok(Self {
+            chunk_store,
+            series,
+            schedule_config: ScheduleConfig::default(),
+        })
+    }
+
+    fn compact(&mut self, series_key: i64, schedule: Schedule) -> Result<(), SetChunkError> {
+        let series = if let Some(s) = self.series.get_mut(&series_key) {
+            s
+        } else {
+            return Ok(());
+        };
+
+        let mut early_vals = {
+            // after this, retained contains all keys >= schedule.chunk_end,
+            // while the original series contains everything before.
+            // therefore, we swap retained and series value to get everything old
+            let mut retained = series.data.data.split_off(&schedule.chunk_end);
+            std::mem::swap(&mut retained, &mut series.data.data);
+            retained
+        };
+
+        // early vals is now every value with time < chunk_end.
+        // it may still contain data that is before chunk start.
+        // TODO: compact early data correctly.
+
+        // Drop early values for now
+        early_vals.retain(|&k, _v| k >= schedule.chunk_start);
+
+        // set new schedule for remaining data
+        if let Some(first_time) = series.data.first_time() {
+            series.schedule = Some(self.schedule_config.init_schedule_from_time(first_time));
+        }
+
+        // compress chunk
+        let chunk_series = RawSeries { data: early_vals };
+        let chunk = Chunk::compress_series(&chunk_series);
+        drop(chunk_series);
+
+        // store chunk
+        self.chunk_store
+            .set_chunk(series_key, schedule.chunk_start, schedule.chunk_end, &chunk)?;
+        Ok(())
+    }
+
+    pub fn insert(&mut self, series_key: i64, data_point: DataPoint) {
+        let series = self
+            .series
+            .entry(series_key)
+            .or_insert_with(|| Series::new(self.schedule_config));
+        match series.insert(data_point) {
+            InsertStatus::Cached => {}
+            InsertStatus::CompactmentPending(schedule) => {
+                self.compact(series_key, schedule).unwrap()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{raw_compress, raw_decompress, Chunk, DataPoint, KelpieChunkStore, RawSeries};
+    use rand::Rng;
+
+    use super::*;
 
     #[test]
-    fn should_create_sqlite_chunk_store() -> Result<(), Box<dyn std::error::Error>> {
-        let _store = super::SqliteChunkStore::new_memory()?;
+    fn should_create() -> Result<(), Box<dyn std::error::Error>> {
+        let _kelpie = Kelpie::new_memory()?;
         Ok(())
     }
 
     #[test]
-    fn should_store_chunk() -> Result<(), Box<dyn std::error::Error>> {
-        let mut store = super::SqliteChunkStore::new_memory()?;
-        let chunk = Chunk {
-            compressed_data: vec![],
-        };
-        store.set_chunk(0, 10, 100, &chunk)?;
-        Ok(())
-    }
-
-    #[test]
-    fn should_not_find_nonexisting_chunk() -> Result<(), Box<dyn std::error::Error>> {
-        let store = super::SqliteChunkStore::new_memory()?;
-        let res = store.get_chunk(0, 10, 100)?;
-        if (res.is_some()) {
-            return Err("there should be no chunk")?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn should_retrive_chunk() -> Result<(), Box<dyn std::error::Error>> {
-        let mut store = super::SqliteChunkStore::new_memory()?;
-        let chunk = Chunk {
-            compressed_data: vec![],
-        };
-        store.set_chunk(0, 10, 100, &chunk)?;
-        let (_, stored) = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
-        if (chunk.compressed_data != stored.compressed_data) {
-            return Err("chunks don't match")?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn should_retrive_smallest_chunk() -> Result<(), Box<dyn std::error::Error>> {
-        let mut store = super::SqliteChunkStore::new_memory()?;
-
-        store.set_chunk(
-            0,
-            1,
-            9,
-            &Chunk {
-                compressed_data: vec![2],
-            },
-        )?;
-        store.set_chunk(
-            0,
-            0,
-            50,
-            &Chunk {
-                compressed_data: vec![5, 6],
-            },
-        )?;
-        store.set_chunk(
-            0,
-            50,
-            200,
-            &Chunk {
-                compressed_data: vec![5, 6],
-            },
-        )?;
-        store.set_chunk(
-            0,
-            10,
-            100,
-            &Chunk {
-                compressed_data: vec![],
-            },
-        )?;
-        store.set_chunk(
-            0,
-            0,
-            1000,
-            &Chunk {
-                compressed_data: vec![1],
-            },
-        )?;
-        let (_, stored) = store.get_chunk(0, 10, 100)?.ok_or("no chunk found")?;
-        if stored.compressed_data != vec![] {
-            return Err("chunks don't match")?;
-        }
-        Ok(())
-    }
-
-    fn decompressed_eq_compressed(raw: &RawSeries) -> Result<bool, Box<dyn std::error::Error>> {
-        let compressed = raw_compress(raw);
-        let decompressed = match raw_decompress(&compressed) {
-            Ok(v) => v,
-            Err(_e) => return Err("failed to decompress")?,
-        };
-
-        println!(
-            "raw: {}, compressed: {}, ratio: {}",
-            raw.serial_size_hint(),
-            compressed.len(),
-            compressed.len() as f64 / raw.serial_size_hint() as f64
-        );
-        Ok(raw.eq(&decompressed))
-    }
-
-    #[test]
-    fn should_cycle_compression() -> Result<(), Box<dyn std::error::Error>> {
+    fn should_insert() -> Result<(), Box<dyn std::error::Error>> {
         use rand::prelude::*;
         use rand::rngs::SmallRng;
+
+        let mut kelpie = Kelpie::new_memory()?;
         let mut rng = SmallRng::seed_from_u64(0xdeadbeef);
-        let mut series = vec![];
         // float series
-        for _ in 0..20 {
-            let mut serie: RawSeries = RawSeries::new();
-            let num_points: u16 = rng.gen_range(3500..3700);
-            let mut last_time_ms: i64 = 1722180250000;
-            let mut last_val: f64 = rng.gen_range(0.0..100.0);
-            let val_variance: f64 = rng.gen_range(0.01..20.0);
-            for _ in 0..num_points {
-                let time_inc = rng.gen_range(400..1100);
-                last_time_ms += time_inc;
-                let time = last_time_ms;
-                let val_inc = rng.gen_range(-val_variance..val_variance);
-                last_val += val_inc;
-                // truncate precision of floats to simulate less random measurements
-                let value = f64::from_bits(last_val.to_bits() & (!0 << 36));
-                assert!((last_val - value).abs() < 1.0);
-                serie.insert(DataPoint { time, value })
-            }
-            series.push(serie);
-        }
+        const SERIES: usize = 64;
+        let mut times: [i64; SERIES] = [1722180250000; SERIES];
+        let mut vals: [f64; SERIES] = [0.0; SERIES];
+        let val_variance = 20.0;
+        for _ in 0..100_000 {
+            let series_key = rng.gen_range(0..SERIES);
+            let last_time = &mut times[series_key];
+            let last_val = &mut vals[series_key];
 
-        // int as float series
-        for _ in 0..30 {
-            let mut serie: RawSeries = RawSeries::new();
-            let num_points: u16 = rng.gen_range(3500..3700);
-            let mut last_time_ms: i64 = 1722180250000;
-            let mut last_val: i64 = rng.gen_range(0..100000);
-            let val_variance: i64 = rng.gen_range(10..100);
-            for _ in 0..num_points {
-                let time_inc = rng.gen_range(400..1102);
-                last_time_ms += time_inc;
-                let time = last_time_ms;
-                let val_inc = rng.gen_range(-val_variance..val_variance);
-                last_val += val_inc;
-                serie.insert(DataPoint {
-                    time,
-                    value: last_val as f64,
-                })
-            }
-            series.push(serie);
-        }
+            let time_inc = rng.gen_range(400..1100);
+            *last_time += time_inc;
+            let time = *last_time;
 
-        for serie in series {
-            if !decompressed_eq_compressed(&serie)? {
-                Err("not equal")?;
-            }
-        }
+            let val_inc = rng.gen_range(-val_variance..val_variance);
+            *last_val += val_inc;
 
+            // truncate precision of floats to simulate less random measurements
+            let value = f64::from_bits(last_val.to_bits() & (!0 << 36));
+            assert!((*last_val - value).abs() < 1.0);
+            let point = DataPoint { time, value };
+
+            kelpie.insert(series_key as i64, point);
+        }
         Ok(())
     }
 
-    #[test]
-    fn should_compress_raw_series() -> Result<(), Box<dyn std::error::Error>> {
-        let mut series = RawSeries::new();
-        let test_time_secs = 1722180250;
-        for i in 0..3600 * 6 {
-            series.insert(DataPoint {
-                time: (test_time_secs + i) * 1000,
-                value: i as f64 * 100.0,
-            });
+    #[derive(Debug)]
+    enum Cmd {
+        Insert {
+            series_key: i64,
+            points: Vec<DataPoint>,
+        },
+        Query {
+            series_key: i64,
+            start: i64,
+            stop: i64,
+        },
+    }
+
+    impl Cmd {
+        fn get_series_key(&self) -> i64 {
+            match self {
+                Cmd::Insert { series_key, .. } => *series_key,
+                Cmd::Query { series_key, .. } => *series_key,
+            }
         }
-        let encoded = raw_compress(&series);
-        println!(
-            "raw: {}, compressed: {}, ratio: {}",
-            series.serial_size_hint(),
-            encoded.len(),
-            encoded.len() as f64 / series.serial_size_hint() as f64
-        );
+
+        fn gen_cmd<R: Rng>(
+            rng: &mut R,
+            series_key: i64,
+            last_time: &mut i64,
+            last_val: &mut f64,
+            variance: f64,
+        ) -> Self {
+            match rng.gen_range(0..10) {
+                // query
+                0 => {
+                    let start: i64 = *last_time + rng.gen_range(-10_000..10_000);
+                    let size = rng.gen_range(1..(3600 * 2));
+                    let stop = start + size;
+                    Cmd::Query {
+                        series_key: series_key as i64,
+                        start,
+                        stop,
+                    }
+                }
+                // insert
+                _ => {
+                    let count = rng.gen_range(0..64);
+                    let mut points = vec![];
+                    for _ in 0..count {
+                        let time_inc = rng.gen_range(400..1100);
+                        *last_time += time_inc;
+                        let time = *last_time;
+
+                        let val_inc = rng.gen_range(-variance..variance);
+                        *last_val += val_inc;
+
+                        // truncate precision of floats to simulate less random measurements
+                        let value = f64::from_bits(last_val.to_bits() & (!0 << 36));
+                        assert!((*last_val - value).abs() < 1.0);
+                        let point = DataPoint { time, value };
+                        points.push(point);
+                    }
+                    Cmd::Insert {
+                        series_key: series_key as i64,
+                        points,
+                    }
+                }
+            }
+        }
+    }
+
+    fn kelpie_eq_fake(cmds: &[Cmd]) -> Result<(), Box<dyn std::error::Error>> {
+        let mut kelpie = Kelpie::new_memory()?;
+        let mut fake = KelpieFake::new();
+        for cmd in cmds {
+            dbg!(cmd);
+            match cmd {
+                &Cmd::Insert { series_key, ref points } => {
+                    for &point in points {
+                        kelpie.insert(series_key, point);
+                        fake.insert(series_key, point);
+                    }
+                }
+                &Cmd::Query {
+                    series_key,
+                    start,
+                    stop,
+                } => {
+                    let kelpie_res = kelpie.query(series_key, start, stop)?;
+                    let fake_res = fake.query(series_key, start, stop)?;
+                    assert_eq!(kelpie_res, fake_res);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test] 
+    fn it_should_match_fake_example() -> Result<(), Box<dyn std::error::Error>> {
+        use Cmd::*;
+        let cmds = vec![Insert {
+            series_key: 44,
+            points: vec![
+                DataPoint {
+                    time: 1722180250542,
+                    value: 1.9446563720703125,
+                },
+                DataPoint {
+                    time: 1722180251591,
+                    value: -7.3121337890625,
+                },
+                DataPoint {
+                    time: 1722180252348,
+                    value: 3.3428955078125,
+                },
+                DataPoint {
+                    time: 1722180253315,
+                    value: 5.15826416015625,
+                },
+                DataPoint {
+                    time: 1722180254180,
+                    value: 20.19775390625,
+                },
+                DataPoint {
+                    time: 1722180254720,
+                    value: 23.616943359375,
+                },
+                DataPoint {
+                    time: 1722180255534,
+                    value: 19.058349609375,
+                },
+                DataPoint {
+                    time: 1722180256630,
+                    value: 0.9685516357421875,
+                },
+                DataPoint {
+                    time: 1722180257237,
+                    value: -7.38482666015625,
+                },
+                DataPoint {
+                    time: 1722180257727,
+                    value: -19.83203125,
+                },
+                DataPoint {
+                    time: 1722180258480,
+                    value: -23.98486328125,
+                },
+                DataPoint {
+                    time: 1722180259575,
+                    value: -26.640380859375,
+                },
+                DataPoint {
+                    time: 1722180260532,
+                    value: -16.98291015625,
+                },
+                DataPoint {
+                    time: 1722180261335,
+                    value: -18.25244140625,
+                },
+                DataPoint {
+                    time: 1722180262266,
+                    value: -20.137451171875,
+                },
+                DataPoint {
+                    time: 1722180262859,
+                    value: -2.533538818359375,
+                },
+                DataPoint {
+                    time: 1722180263615,
+                    value: 12.406982421875,
+                },
+                DataPoint {
+                    time: 1722180264410,
+                    value: -0.018148422241210938,
+                },
+                DataPoint {
+                    time: 1722180265119,
+                    value: -7.62786865234375,
+                },
+                DataPoint {
+                    time: 1722180266041,
+                    value: 1.5860137939453125,
+                },
+                DataPoint {
+                    time: 1722180266930,
+                    value: 0.8058090209960938,
+                },
+                DataPoint {
+                    time: 1722180267830,
+                    value: -14.1217041015625,
+                },
+                DataPoint {
+                    time: 1722180268705,
+                    value: -21.812744140625,
+                },
+                DataPoint {
+                    time: 1722180269324,
+                    value: -6.90911865234375,
+                },
+                DataPoint {
+                    time: 1722180270274,
+                    value: -15.9766845703125,
+                },
+                DataPoint {
+                    time: 1722180270970,
+                    value: -20.261474609375,
+                },
+                DataPoint {
+                    time: 1722180271681,
+                    value: -0.5149459838867188,
+                },
+                DataPoint {
+                    time: 1722180272184,
+                    value: -5.525146484375,
+                },
+                DataPoint {
+                    time: 1722180273067,
+                    value: 5.13946533203125,
+                },
+                DataPoint {
+                    time: 1722180273875,
+                    value: 23.054443359375,
+                },
+                DataPoint {
+                    time: 1722180274337,
+                    value: 25.7763671875,
+                },
+                DataPoint {
+                    time: 1722180275281,
+                    value: 24.168212890625,
+                },
+                DataPoint {
+                    time: 1722180276304,
+                    value: 15.8856201171875,
+                },
+                DataPoint {
+                    time: 1722180276933,
+                    value: 10.1092529296875,
+                },
+                DataPoint {
+                    time: 1722180277447,
+                    value: -6.6290283203125,
+                },
+                DataPoint {
+                    time: 1722180278182,
+                    value: -23.884033203125,
+                },
+                DataPoint {
+                    time: 1722180278959,
+                    value: -33.09765625,
+                },
+                DataPoint {
+                    time: 1722180279967,
+                    value: -20.55078125,
+                },
+                DataPoint {
+                    time: 1722180280736,
+                    value: -31.531005859375,
+                },
+                DataPoint {
+                    time: 1722180281737,
+                    value: -48.88037109375,
+                },
+                DataPoint {
+                    time: 1722180282505,
+                    value: -38.64404296875,
+                },
+                DataPoint {
+                    time: 1722180283073,
+                    value: -22.06103515625,
+                },
+                DataPoint {
+                    time: 1722180283915,
+                    value: -18.541259765625,
+                },
+                DataPoint {
+                    time: 1722180284992,
+                    value: -26.884033203125,
+                },
+                DataPoint {
+                    time: 1722180285847,
+                    value: -12.86767578125,
+                },
+                DataPoint {
+                    time: 1722180286712,
+                    value: -26.864013671875,
+                },
+                DataPoint {
+                    time: 1722180287723,
+                    value: -40.82470703125,
+                },
+                DataPoint {
+                    time: 1722180288792,
+                    value: -59.51953125,
+                },
+                DataPoint {
+                    time: 1722180289217,
+                    value: -54.57275390625,
+                },
+                DataPoint {
+                    time: 1722180289811,
+                    value: -72.6044921875,
+                },
+                DataPoint {
+                    time: 1722180290681,
+                    value: -71.1044921875,
+                },
+                DataPoint {
+                    time: 1722180291147,
+                    value: -70.412109375,
+                },
+                DataPoint {
+                    time: 1722180292205,
+                    value: -52.68115234375,
+                },
+            ],
+        },
+        Query {
+            series_key: 44,
+            start: 1722180284390,
+            stop: 1722180286869,
+        }];
+
+        kelpie_eq_fake(&cmds)
+    }
+
+    #[test]
+    fn it_should_match_fake() -> Result<(), Box<dyn std::error::Error>> {
+        use rand::prelude::*;
+        use rand::rngs::SmallRng;
+
+        let mut rng = SmallRng::seed_from_u64(0xdeadbeef);
+
+        const SERIES: usize = 64;
+        let mut times: [i64; SERIES] = [1722180250000; SERIES];
+        let mut vals: [f64; SERIES] = [0.0; SERIES];
+
+        let mut cmds = vec![];
+        for _ in 0..1000 {
+            let series_key = rng.gen_range(0..SERIES);
+            let cmd = Cmd::gen_cmd(
+                &mut rng,
+                series_key as i64,
+                &mut times[series_key],
+                &mut vals[series_key],
+                20.0,
+            );
+            if cmd.get_series_key() == 44 {
+                cmds.push(cmd);
+            }
+        }
+        
+        kelpie_eq_fake(&cmds)?;
+
         Ok(())
     }
 }
