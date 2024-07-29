@@ -282,8 +282,11 @@ impl Kelpie {
 #[cfg(test)]
 mod tests {
     use core::f64;
+    use std::io::Write;
 
     use super::*;
+    use q_compress::CompressorConfig;
+    use q_compress::DecompressorConfig;
     use quickcheck::quickcheck;
     use quickcheck::Arbitrary;
 
@@ -659,61 +662,48 @@ mod tests {
     fn input1_that_kills_qcompress() {
         use Cmd::*;
         type Point = DataPoint;
+        let series_key = 0;
+        // these for vals when compressed using our qcompress settings trigger subtract with overflow in qcompress
+        let vals = [
+            2.8170090551184303e209,
+            4.2984146959204563e204,
+            2.8170090551184244e209,
+            2.773899791842187e209,
+        ];
         let cmds = vec![
             Insert {
-                series_key: 7740398493674204011,
+                series_key,
                 point: Point {
-                    time: 7740398493674201707,
-                    value: 4.2984146959204563e204,
+                    time: 0,
+                    value: vals[0],
                 },
             },
             Insert {
-                series_key: 7740398493674204011,
+                series_key,
                 point: Point {
-                    time: 7740398493674204011,
-                    value: 2.773899791842187e209,
+                    time: 1,
+                    value: vals[1],
                 },
             },
             Insert {
-                series_key: 7740398493674204011,
+                series_key,
                 point: Point {
-                    time: 7740398491872002156,
-                    value: 2.8170090551184303e209,
+                    time: 2,
+                    value: vals[2],
                 },
             },
             Insert {
-                series_key: 5620482900717431659,
+                series_key,
                 point: Point {
-                    time: -36028800961207809,
-                    value: 9.585785089134067e247,
+                    time: 3,
+                    value: vals[3],
                 },
             },
             Insert {
-                series_key: 7740398493674204011,
+                series_key,
                 point: Point {
-                    time: 7740398493673548651,
-                    value: 2.8170090551184303e209,
-                },
-            },
-            Insert {
-                series_key: 7740398493674204011,
-                point: Point {
-                    time: 7740398493669550955,
-                    value: 2.8170090551184303e209,
-                },
-            },
-            Insert {
-                series_key: 7740398493674204011,
-                point: Point {
-                    time: 7740398493674202475,
-                    value: 2.8170090551184244e209,
-                },
-            },
-            Insert {
-                series_key: 7740398493674204011,
-                point: Point {
-                    time: 39806716479236971,
-                    value: 5.41582490789e-312,
+                    time: 3600000,
+                    value: 0.0,
                 },
             },
         ];
@@ -724,58 +714,91 @@ mod tests {
     fn input2_that_kills_qcompress() {
         use Cmd::*;
         type Point = DataPoint;
+        let series_key = 0;
+        let chunk_size = 60 * 60 * 1000;
+        let vals = [
+            2.8170090551184303e209,
+            2.8169933786932377e209,
+            2.8170090551184303e209,
+            -2.8170090551184303e209,
+            2.817009055114319e209,
+        ];
         let cmds = vec![
             Insert {
-                series_key: 7740398493674204011,
+                series_key,
                 point: Point {
-                    time: 7740398493674206059,
-                    value: 2.817009055114319e209,
+                    time: 0,
+                    value: vals[0],
                 },
             },
             Insert {
-                series_key: 7740398493674204011,
+                series_key,
                 point: Point {
-                    time: 7740398493674192235,
-                    value: 2.8169933786932377e209,
+                    time: 1,
+                    value: vals[1],
                 },
             },
             Insert {
-                series_key: 7740398493674204011,
+                series_key,
                 point: Point {
-                    time: 7740398493674189409,
-                    value: 2.8170090551184303e209,
+                    time: 2,
+                    value: vals[2],
                 },
             },
             Insert {
-                series_key: 7740398493674204011,
+                series_key,
                 point: Point {
-                    time: 7740398493674203951,
-                    value: 2.8170090551184303e209,
+                    time: 3,
+                    value: vals[3],
                 },
             },
             Insert {
-                series_key: 7740398493674204011,
+                series_key,
                 point: Point {
-                    time: 7740398493674204011,
-                    value: -2.8170090551184303e209,
-                },
-            },
-            Insert {
-                series_key: 7740398493674204011,
-                point: Point {
-                    time: 7740398493683941375,
-                    value: 2.8170200837294834e209,
-                },
-            },
-            Insert {
-                series_key: 7740398493674204011,
-                point: Point {
-                    time: 7740398493674204011,
-                    value: 2.8170090551184303e209,
+                    time: 4,
+                    value: vals[4],
                 },
             },
             Insert {
                 series_key: 0,
+                point: Point {
+                    time: chunk_size,
+                    value: 0.0,
+                },
+            },
+        ];
+        kelpie_eq_fake(&cmds).unwrap();
+    }
+
+    #[test]
+    fn input3_that_kills_qcompress() {
+        use Cmd::*;
+        type Point = DataPoint;
+        let series_key: i64 = 0;
+        let a = f64::from_bits(0x8000000000004000);
+        let b = f64::from_bits(0x8000000000000000);
+        let cmds = vec![
+            Insert {
+                series_key,
+                point: Point { time: 0, value: a },
+            },
+            Insert {
+                series_key,
+                point: Point { time: 1, value: -a },
+            },
+            Insert {
+                series_key,
+                point: Point { time: 2, value: b },
+            },
+            Insert {
+                series_key,
+                point: Point {
+                    time: 60 * 60 * 1000 + 1,
+                    value: 0.0,
+                },
+            },
+            Insert {
+                series_key,
                 point: Point {
                     time: 0,
                     value: 0.0,
@@ -783,5 +806,23 @@ mod tests {
             },
         ];
         kelpie_eq_fake(&cmds).unwrap();
+    }
+
+    #[test]
+    fn qcompress_demo() {
+        use q_compress::{Compressor, CompressorConfig, Decompressor, DecompressorConfig};
+        let a = f64::from_bits(0x8000000000004000);
+        let b = f64::from_bits(0x8000000000000000);
+        let cfg = CompressorConfig::default()
+            .with_use_gcds(false)
+            .with_delta_encoding_order(1)
+            .with_compression_level(8);
+        let mut compressor = Compressor::<f64>::from_config(cfg);
+        let compressed = compressor.simple_compress(&[a, -a, b]);
+        let mut decompressor: Decompressor<f64> =
+            Decompressor::from_config(DecompressorConfig::default());
+        decompressor.write_all(&compressed).unwrap();
+        let decompressed = decompressor.simple_decompress().unwrap();
+        assert_eq!(&[a, -a, b], decompressed.as_slice());
     }
 }
