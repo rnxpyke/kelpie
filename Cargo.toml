@@ -10,4 +10,9 @@ sqlite3-sys = { version = "0.17.0", features = ["bundled"], default-features = f
 thiserror = "1.0.63"
 
 [dev-dependencies]
+
+arbitrary = "1.3.2"
+derive_arbitrary = "1.3.2"
+quickcheck = "1.0.3"
+quickcheck_macros = "1.0.0"
 rand = { version = "0.8.5", features = ["small_rng"] }

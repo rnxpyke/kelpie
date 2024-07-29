@@ -2,10 +2,32 @@ use std::{collections::BTreeMap, io::Write};
 
 use q_compress::{errors::QCompressError, Decompressor, DecompressorConfig};
 
+#[cfg(test)]
+use quickcheck::Arbitrary;
+
 #[derive(Clone, Copy, Debug)]
 pub struct DataPoint {
     pub time: i64,
     pub value: f64,
+}
+
+#[cfg(test)]
+impl Arbitrary for DataPoint {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        DataPoint {
+            time: u32::arbitrary(g) as i64,
+            value: f32::arbitrary(g) as f64,
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let time = self.time;
+        let value = self.value;
+        let iter = i64::shrink(&time)
+            .zip(f64::shrink(&value))
+            .map(|(time, value)| DataPoint { time, value });
+        Box::new(iter)
+    }
 }
 
 #[derive(Debug, PartialEq)]

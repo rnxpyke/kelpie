@@ -1,14 +1,19 @@
 pub mod series;
 pub mod store;
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    hash::Hash,
-};
+#[cfg(test)]
+extern crate quickcheck;
+
+#[cfg(test)]
+#[macro_use]
+extern crate quickcheck_macros;
+
+use std::collections::{BTreeMap, HashMap};
 
 pub use series::{Chunk, DataPoint, DecompressError, RawSeries};
 pub use store::{ChunkMeta, GetChunkError, KelpieChunkStore, SetChunkError, SqliteChunkStore};
 
+#[derive(Debug)]
 pub struct Series {
     schedule: Option<Schedule>,
     schedule_config: ScheduleConfig,
@@ -47,8 +52,8 @@ impl Default for ScheduleConfig {
 impl ScheduleConfig {
     fn init_schedule_from_time(&self, point: i64) -> Schedule {
         // implicitly round down
-        let chunk_start = point / self.chunk_size;
-        let chunk_end = chunk_start + self.chunk_size;
+        let chunk_start = point / self.chunk_size * self.chunk_size;
+        let chunk_end = chunk_start.saturating_add(self.chunk_size);
         Schedule {
             chunk_start,
             chunk_end,
@@ -80,7 +85,11 @@ impl Series {
         }
         let last_time = self.data.last_time().expect(EXPECT_MSG);
         let schedule = self.schedule.expect(EXPECT_MSG);
-        if last_time > schedule.chunk_end + self.schedule_config.compact_after {
+        if last_time
+            > schedule
+                .chunk_end
+                .saturating_add(self.schedule_config.compact_after)
+        {
             return InsertStatus::CompactmentPending(schedule);
         }
         return InsertStatus::Cached;
@@ -115,6 +124,9 @@ impl KelpieFake {
         start: i64,
         stop: i64,
     ) -> Result<RawSeries, GetChunkError> {
+        if start > stop {
+            return Ok(RawSeries::new());
+        }
         let series = if let Some(s) = self.series.get(&series_key) {
             s
         } else {
@@ -177,20 +189,24 @@ impl Kelpie {
         let mut map = BTreeMap::new();
         let mut cur_start = start;
         while cur_start < stop {
-            match self.query_closest_chunk(series_key, cur_start, stop)? {
+            let cur_chunk = self.schedule_config.init_schedule_from_time(cur_start);
+            let closest =
+                self.query_closest_chunk(series_key, cur_chunk.chunk_start, cur_chunk.chunk_end)?;
+            match closest {
                 Some((meta, mut chunk)) => {
                     map.append(&mut chunk.data);
-                    // this should not happen, this break is just here to prevent infinite loops,
-                    // maybe turn into error
-                    if meta.stop <= cur_start {
-                        break;
-                    }
-                    cur_start = meta.stop;
+                    cur_start = if meta.stop <= cur_start {
+                        cur_chunk.chunk_end
+                    } else {
+                        meta.stop
+                    };
                 }
-                None => break,
+                None => cur_start = cur_chunk.chunk_end,
             }
         }
 
+        // cleanup any leftovers from unaligned chunks
+        map.retain(|&k, _v| start <= k && k < stop);
         Ok(RawSeries { data: map })
     }
 
@@ -253,15 +269,17 @@ impl Kelpie {
             InsertStatus::CompactmentPending(schedule) => {
                 self.compact(series_key, schedule).unwrap()
             }
-        }
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
+    use core::f64;
 
     use super::*;
+    use quickcheck::quickcheck;
+    use quickcheck::Arbitrary;
 
     #[test]
     fn should_create() -> Result<(), Box<dyn std::error::Error>> {
@@ -303,11 +321,11 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     enum Cmd {
         Insert {
             series_key: i64,
-            points: Vec<DataPoint>,
+            point: DataPoint,
         },
         Query {
             series_key: i64,
@@ -316,6 +334,48 @@ mod tests {
         },
     }
 
+    impl quickcheck::Arbitrary for Cmd {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            let series_key = u8::arbitrary(g) as i64;
+            let variant: u8 = u8::arbitrary(g);
+            match variant {
+                0 => {
+                    let start = Arbitrary::arbitrary(g);
+                    let size = u16::arbitrary(g);
+                    Cmd::Query {
+                        series_key,
+                        start,
+                        stop: start.saturating_add(size as i64),
+                    }
+                }
+                _ => {
+                    let points = Arbitrary::arbitrary(g);
+                    Cmd::Insert {
+                        series_key,
+                        point: points,
+                    }
+                }
+            }
+        }
+
+        /*
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            match self {
+                &Cmd::Insert { series_key, point } => {
+                    let iter = DataPoint::shrink(&point).map(|point| Cmd::Insert { series_key: 0, point })
+                        .chain(DataPoint::shrink(&point).map(move |point| Cmd::Insert { series_key, point: point }));
+                    Box::new(iter)
+                },
+                &Cmd::Query { series_key, start, stop } => {
+                    let iter = iter::once(Cmd::Query { series_key: 0, start, stop });
+                    Box::new(iter)
+                },
+            }
+        }
+        */
+    }
+
+    /*
     impl Cmd {
         fn get_series_key(&self) -> i64 {
             match self {
@@ -323,64 +383,17 @@ mod tests {
                 Cmd::Query { series_key, .. } => *series_key,
             }
         }
-
-        fn gen_cmd<R: Rng>(
-            rng: &mut R,
-            series_key: i64,
-            last_time: &mut i64,
-            last_val: &mut f64,
-            variance: f64,
-        ) -> Self {
-            match rng.gen_range(0..10) {
-                // query
-                0 => {
-                    let start: i64 = *last_time + rng.gen_range(-10_000..10_000);
-                    let size = rng.gen_range(1..(3600 * 2));
-                    let stop = start + size;
-                    Cmd::Query {
-                        series_key: series_key as i64,
-                        start,
-                        stop,
-                    }
-                }
-                // insert
-                _ => {
-                    let count = rng.gen_range(0..64);
-                    let mut points = vec![];
-                    for _ in 0..count {
-                        let time_inc = rng.gen_range(400..1100);
-                        *last_time += time_inc;
-                        let time = *last_time;
-
-                        let val_inc = rng.gen_range(-variance..variance);
-                        *last_val += val_inc;
-
-                        // truncate precision of floats to simulate less random measurements
-                        let value = f64::from_bits(last_val.to_bits() & (!0 << 36));
-                        assert!((*last_val - value).abs() < 1.0);
-                        let point = DataPoint { time, value };
-                        points.push(point);
-                    }
-                    Cmd::Insert {
-                        series_key: series_key as i64,
-                        points,
-                    }
-                }
-            }
-        }
     }
+    */
 
     fn kelpie_eq_fake(cmds: &[Cmd]) -> Result<(), Box<dyn std::error::Error>> {
         let mut kelpie = Kelpie::new_memory()?;
         let mut fake = KelpieFake::new();
         for cmd in cmds {
-            dbg!(cmd);
             match cmd {
-                &Cmd::Insert { series_key, ref points } => {
-                    for &point in points {
-                        kelpie.insert(series_key, point);
-                        fake.insert(series_key, point);
-                    }
+                &Cmd::Insert { series_key, point } => {
+                    kelpie.insert(series_key, point);
+                    fake.insert(series_key, point);
                 }
                 &Cmd::Query {
                     series_key,
@@ -389,64 +402,213 @@ mod tests {
                 } => {
                     let kelpie_res = kelpie.query(series_key, start, stop)?;
                     let fake_res = fake.query(series_key, start, stop)?;
-                    assert_eq!(kelpie_res, fake_res);
+                    dbg!(&kelpie_res, &fake_res);
+                    if kelpie_res != fake_res {
+                        return Err("not matching")?;
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    #[test] 
-    fn it_should_match_fake_example() -> Result<(), Box<dyn std::error::Error>> {
-        use Cmd::*;
-        let x = 3750000;
-        let series_key = 0;
-        let cmds = vec![Insert {
-            series_key,
-            points: vec![
-                DataPoint {
-                    time: x,
-                    value: 0.0,
-                },
-            ],
-        },
-        Query {
-            series_key,
-            start: x-1,
-            stop: x+1,
-        }];
+    /*
+    trait Bisect: Sized + Copy {
+        fn midpoint(min: Self, max: Self) -> Option<Self>;
+        fn binary_search(mut min: Self, mut max: Self, pred: impl Fn(Self) -> bool) -> Self {
+            loop {
+                if let Some(midpoint) = Bisect::midpoint(min, max) {
+                    if pred(midpoint) {
+                        max = midpoint;
+                    } else {
+                        min = midpoint;
+                    }
+                } else {
+                    return min;
+                }
+            }
+        }
+    }
 
-        kelpie_eq_fake(&cmds)
+    impl Bisect for i64 {
+        fn midpoint(min: Self, max: Self) -> Option<Self> {
+            if min >= max {
+                return None;
+            }
+            let half = (max - min) / 2;
+            if half == 0 {
+                return None;
+            }
+            return Some(min + half);
+        }
+    }
+    */
+
+    #[test]
+    fn it_should_match_exact_query() -> Result<(), Box<dyn std::error::Error>> {
+        use Cmd::*;
+        fn make_cmds(x: i64) -> Vec<Cmd> {
+            let series_key = 0;
+            let cmds = vec![
+                Insert {
+                    series_key,
+                    point: DataPoint {
+                        time: x,
+                        value: 0.0,
+                    },
+                },
+                Query {
+                    series_key,
+                    start: x - 1,
+                    stop: x + 1,
+                },
+            ];
+            return cmds;
+        }
+
+        let point = 3600000;
+
+        kelpie_eq_fake(&make_cmds(point - 1))?;
+        kelpie_eq_fake(&make_cmds(point + 0))?;
+        kelpie_eq_fake(&make_cmds(point + 1))?;
+        Ok(())
     }
 
     #[test]
-    fn it_should_match_fake() -> Result<(), Box<dyn std::error::Error>> {
-        use rand::prelude::*;
-        use rand::rngs::SmallRng;
-
-        let mut rng = SmallRng::seed_from_u64(0xdeadbeef);
-
-        const SERIES: usize = 64;
-        let mut times: [i64; SERIES] = [1722180250000; SERIES];
-        let mut vals: [f64; SERIES] = [0.0; SERIES];
-
-        let mut cmds = vec![];
-        for _ in 0..1000 {
-            let series_key = rng.gen_range(0..SERIES);
-            let cmd = Cmd::gen_cmd(
-                &mut rng,
-                series_key as i64,
-                &mut times[series_key],
-                &mut vals[series_key],
-                20.0,
-            );
-            if cmd.get_series_key() == 44 {
-                cmds.push(cmd);
-            }
+    fn it_should_match_huge_query() -> Result<(), Box<dyn std::error::Error>> {
+        use Cmd::*;
+        fn make_cmds(x: i64) -> Vec<Cmd> {
+            let series_key = 0;
+            let cmds = vec![
+                Insert {
+                    series_key,
+                    point: DataPoint {
+                        time: x,
+                        value: 0.0,
+                    },
+                },
+                Query {
+                    series_key,
+                    start: 0,
+                    stop: 10000000,
+                },
+            ];
+            return cmds;
         }
-        
-        kelpie_eq_fake(&cmds)?;
 
+        kelpie_eq_fake(&make_cmds(3600000 - 100))?;
+        kelpie_eq_fake(&make_cmds(3600000 - 1))?;
+        kelpie_eq_fake(&make_cmds(3600000 + 0))?;
+        kelpie_eq_fake(&make_cmds(3600000 + 1))?;
+        kelpie_eq_fake(&make_cmds(3600000 + 100))?;
         Ok(())
+    }
+
+    #[test]
+    fn it_should_match_big_forward_diff() -> Result<(), Box<dyn std::error::Error>> {
+        use Cmd::*;
+        fn make_cmds(x: i64) -> Vec<Cmd> {
+            let series_key = 0;
+            let cmds = vec![
+                Insert {
+                    series_key,
+                    point: DataPoint {
+                        time: 0,
+                        value: 0.0,
+                    },
+                },
+                Query {
+                    series_key,
+                    start: 0,
+                    stop: 1,
+                },
+                Insert {
+                    series_key,
+                    point: DataPoint {
+                        time: x,
+                        value: 0.0,
+                    },
+                },
+                Query {
+                    series_key,
+                    start: 0,
+                    stop: 1,
+                },
+                Query {
+                    series_key,
+                    start: x,
+                    stop: x + 1,
+                },
+            ];
+            return cmds;
+        }
+
+        kelpie_eq_fake(&make_cmds(0))?;
+        kelpie_eq_fake(&make_cmds(1))?;
+        kelpie_eq_fake(&make_cmds(2))?;
+        kelpie_eq_fake(&make_cmds(100))?;
+        kelpie_eq_fake(&make_cmds(1000))?;
+        kelpie_eq_fake(&make_cmds(3600000 - 1))?;
+        kelpie_eq_fake(&make_cmds(3600000 + 0))?;
+        kelpie_eq_fake(&make_cmds(3600000 + 1))?;
+        kelpie_eq_fake(&make_cmds(3600000 * 2))?;
+        Ok(())
+    }
+
+    #[test]
+    fn it_should_match_huge_reverse_diff() -> Result<(), Box<dyn std::error::Error>> {
+        use Cmd::*;
+        fn make_cmds(x: i64) -> Vec<Cmd> {
+            let series_key = 0;
+            let cmds = vec![
+                Insert {
+                    series_key,
+                    point: DataPoint {
+                        time: x,
+                        value: 0.0,
+                    },
+                },
+                Query {
+                    series_key,
+                    start: x,
+                    stop: x + 1,
+                },
+                Insert {
+                    series_key,
+                    point: DataPoint {
+                        time: 0,
+                        value: 0.0,
+                    },
+                },
+                Query {
+                    series_key,
+                    start: x,
+                    stop: x + 1,
+                },
+                Query {
+                    series_key,
+                    start: 0,
+                    stop: 1,
+                },
+            ];
+            return cmds;
+        }
+
+        kelpie_eq_fake(&make_cmds(0))?;
+        kelpie_eq_fake(&make_cmds(1))?;
+        kelpie_eq_fake(&make_cmds(2))?;
+        kelpie_eq_fake(&make_cmds(100))?;
+        kelpie_eq_fake(&make_cmds(1000))?;
+        kelpie_eq_fake(&make_cmds(3600000 - 1))?;
+        kelpie_eq_fake(&make_cmds(3600000 + 0))?;
+        kelpie_eq_fake(&make_cmds(3600000 + 1))?;
+        kelpie_eq_fake(&make_cmds(3600000 * 2))?;
+        Ok(())
+    }
+
+    #[quickcheck]
+    fn matches_fake(cmds: Vec<Cmd>) -> bool {
+        dbg!(cmds.len());
+        kelpie_eq_fake(&cmds).is_ok()
     }
 }
