@@ -64,6 +64,10 @@ impl RawSeries {
     pub fn last_time(&self) -> Option<i64> {
         Some(*self.data.last_key_value()?.0)
     }
+
+    pub fn serial(&self) -> Vec<DataPoint> {
+        self.data.iter().map(|(&key, &value)| DataPoint { time: key, value }).collect()
+    }
 }
 
 #[derive(Debug)]
