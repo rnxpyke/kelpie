@@ -277,6 +277,13 @@ impl Kelpie {
         let series = self.series.get_mut(&series_key).unwrap();
         assert!(series.try_insert(data_point));
     }
+
+    pub fn flush(&mut self) {
+        let series_keys = self.series.keys().copied().collect::<Vec<_>>();
+        for key in series_keys {
+            self.save_series(key);
+        }
+    }
 }
 
 #[cfg(test)]
