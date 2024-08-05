@@ -1,3 +1,4 @@
+pub mod compress;
 pub mod series;
 pub mod store;
 
@@ -285,8 +286,6 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use q_compress::CompressorConfig;
-    use q_compress::DecompressorConfig;
     use quickcheck::quickcheck;
     use quickcheck::Arbitrary;
 

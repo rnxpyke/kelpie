@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+pco = "0.3.1"
 
 [dependencies.kelpie]
 path = ".."
@@ -27,3 +28,10 @@ test = false
 doc = false
 bench = false
 
+
+[[bin]]
+name = "pco"
+path = "fuzz_targets/pco.rs"
+test = false
+doc = false
+bench = false

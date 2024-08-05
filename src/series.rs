@@ -1,5 +1,8 @@
 use std::{collections::BTreeMap, io::Write};
 
+use pco::errors::PcoResult;
+use pco::standalone::{simple_decompress, simpler_compress};
+use pco::DEFAULT_COMPRESSION_LEVEL;
 use q_compress::{errors::QCompressError, Decompressor, DecompressorConfig};
 
 #[cfg(test)]
@@ -101,19 +104,8 @@ fn raw_decompress(bytes: &[u8]) -> Result<RawSeries, DecompressError> {
     };
     let compressed_vals = &bytes[(times_end + 8)..vals_end];
 
-    let times = {
-        let mut decompressor: Decompressor<i64> =
-            q_compress::Decompressor::from_config(DecompressorConfig::default());
-        decompressor.write_all(compressed_times).unwrap();
-        decompressor.simple_decompress()?
-    };
-
-    let values = {
-        let mut decompressor: Decompressor<f64> =
-            q_compress::Decompressor::from_config(DecompressorConfig::default());
-        decompressor.write_all(compressed_vals).unwrap();
-        decompressor.simple_decompress()?
-    };
+    let times = simple_decompress::<i64>(compressed_times).unwrap();
+    let values = simple_decompress::<f64>(compressed_vals).unwrap();
 
     let mut series = RawSeries::new();
     let mut i = 0;
@@ -134,24 +126,13 @@ fn raw_decompress(bytes: &[u8]) -> Result<RawSeries, DecompressError> {
 }
 
 fn raw_compress(raw: &RawSeries) -> Vec<u8> {
-    use q_compress::CompressorConfig;
     let compressed_times = {
-        let cfg = CompressorConfig::default()
-            .with_use_gcds(false)
-            .with_compression_level(8)
-            .with_delta_encoding_order(2);
         let timevec: Vec<i64> = raw.data.keys().copied().collect();
-
-        q_compress::Compressor::from_config(cfg).simple_compress(&timevec)
+        simpler_compress(&timevec, DEFAULT_COMPRESSION_LEVEL).unwrap()
     };
     let compressed_vals = {
-        let cfg = CompressorConfig::default()
-            .with_use_gcds(false)
-            .with_delta_encoding_order(1)
-            .with_compression_level(8);
-        let timevec: Vec<f64> = raw.data.values().copied().collect();
-
-        q_compress::Compressor::from_config(cfg).simple_compress(&timevec)
+        let valvec: Vec<f64> = raw.data.values().copied().collect();
+        simpler_compress(&valvec, DEFAULT_COMPRESSION_LEVEL).unwrap()
     };
     let mut res = vec![0u8; compressed_times.len() + 8 + compressed_vals.len() + 8];
     res[0..8].copy_from_slice(&compressed_times.len().to_le_bytes());
