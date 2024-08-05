@@ -115,7 +115,6 @@ dependencies = [
  "bitvec",
  "derive_arbitrary",
  "pco",
- "q_compress",
  "quickcheck",
  "quickcheck_macros",
  "rand",
@@ -176,12 +175,6 @@ checksum = "5e719e8df665df0d1c8fbfd238015744736151d4445ec0836b8e628aae103b77"
 dependencies = [
  "unicode-ident",
 ]
-
-[[package]]
-name = "q_compress"
-version = "0.11.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dd5eb5dd29cce618dc0348304cbd82333dab2ec98ae56d20dd1a2b38f7ae7d4"
 
 [[package]]
 name = "quickcheck"

@@ -1,9 +1,7 @@
-use std::{collections::BTreeMap, io::Write};
+use std::collections::BTreeMap;
 
-use pco::errors::PcoResult;
 use pco::standalone::{simple_decompress, simpler_compress};
 use pco::DEFAULT_COMPRESSION_LEVEL;
-use q_compress::{errors::QCompressError, Decompressor, DecompressorConfig};
 
 #[cfg(test)]
 use quickcheck::Arbitrary;
@@ -74,11 +72,11 @@ pub enum DecompressError {
     TimesMissing,
     ValHeaderMissing,
     ValsMissing,
-    DecompressError(QCompressError),
+    DecompressError(Box<dyn std::error::Error + 'static>),
 }
 
-impl From<QCompressError> for DecompressError {
-    fn from(value: QCompressError) -> Self {
+impl From<Box<dyn std::error::Error + 'static>> for DecompressError {
+    fn from(value: Box<dyn std::error::Error + 'static>) -> Self {
         Self::DecompressError(value)
     }
 }
@@ -185,7 +183,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0xdeadbeef);
         let mut series = vec![];
         // float series
-        for _ in 0..20 {
+        for _ in 0..500 {
             let mut serie: RawSeries = RawSeries::new();
             let num_points: u16 = rng.gen_range(3500..3700);
             let mut last_time_ms: i64 = 1722180250000;
@@ -198,7 +196,7 @@ mod tests {
                 let val_inc = rng.gen_range(-val_variance..val_variance);
                 last_val += val_inc;
                 // truncate precision of floats to simulate less random measurements
-                let value = f64::from_bits(last_val.to_bits() & (!0 << 36));
+                let value = f64::from_bits(last_val.to_bits() & (!0 << 16));
                 assert!((last_val - value).abs() < 1.0);
                 serie.insert(DataPoint { time, value })
             }

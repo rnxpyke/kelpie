@@ -1,4 +1,3 @@
-pub mod compress;
 pub mod series;
 pub mod store;
 
@@ -282,9 +281,6 @@ impl Kelpie {
 
 #[cfg(test)]
 mod tests {
-    use core::f64;
-    use std::io::Write;
-
     use super::*;
     use quickcheck::quickcheck;
     use quickcheck::Arbitrary;
@@ -805,23 +801,5 @@ mod tests {
             },
         ];
         kelpie_eq_fake(&cmds).unwrap();
-    }
-
-    #[test]
-    fn qcompress_demo() {
-        use q_compress::{Compressor, CompressorConfig, Decompressor, DecompressorConfig};
-        let a = f64::from_bits(0x8000000000004000);
-        let b = f64::from_bits(0x8000000000000000);
-        let cfg = CompressorConfig::default()
-            .with_use_gcds(false)
-            .with_delta_encoding_order(1)
-            .with_compression_level(8);
-        let mut compressor = Compressor::<f64>::from_config(cfg);
-        let compressed = compressor.simple_compress(&[a, -a, b]);
-        let mut decompressor: Decompressor<f64> =
-            Decompressor::from_config(DecompressorConfig::default());
-        decompressor.write_all(&compressed).unwrap();
-        let decompressed = decompressor.simple_decompress().unwrap();
-        assert_eq!(&[a, -a, b], decompressed.as_slice());
     }
 }
